@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Skeleton Hand Detection</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+</head>
+<body>
+    <video id="video" width="640" height="480" autoplay></video>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <button id="start-button">Start Detection</button>
+    <div id="status">Status: No Live Face Detected</div>
+
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js"></script>
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const startButton = document.getElementById('start-button');
+        const statusDiv = document.getElementById('status');
+        let session;
+
+        // Initialize MediaPipe Hands
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({
+            maxNumHands: 2,  // Set to 2 to detect both hands
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        // Handle hand detection results
+        hands.onResults((results) => {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (results.multiHandLandmarks) {
+                results.multiHandLandmarks.forEach((landmarks) => {
+                    drawSkeletonHand(ctx, landmarks);
+                });
+            }
+        });
+
+        // Draw a skeleton hand with connected internal dots
+        function drawSkeletonHand(ctx, landmarks) {
+            ctx.strokeStyle = 'rgba(211, 211, 211, 0.8)'; // Light gray color
+            ctx.lineWidth = 2;
+            ctx.fillStyle = 'black';
+
+            // Draw and connect landmarks based on the skeletal structure
+            const connections = [
+                [0, 1], [1, 2], [2, 3], [3, 4],   // Thumb
+                [0, 5], [5, 6], [6, 7], [7, 8],   // Index finger
+                [5, 9], [9, 10], [10, 11], [11, 12], // Middle finger
+                [9, 13], [13, 14], [14, 15], [15, 16], // Ring finger
+                [13, 17], [17, 18], [18, 19], [19, 20] // Pinky finger
+            ];
+
+            connections.forEach(([start, end]) => {
+                const startX = landmarks[start].x * canvas.width;
+                const startY = landmarks[start].y * canvas.height;
+                const endX = landmarks[end].x * canvas.width;
+                const endY = landmarks[end].y * canvas.height;
+
+                // Draw line connecting two landmarks
+                ctx.beginPath();
+                ctx.moveTo(startX, startY);
+                ctx.lineTo(endX, endY);
+                ctx.stroke();
+
+                // Draw a small circle at each landmark
+                ctx.beginPath();
+                ctx.arc(startX, startY, 5, 0, 2 * Math.PI);
+                ctx.fill();
+                ctx.arc(endX, endY, 5, 0, 2 * Math.PI);
+                ctx.fill();
+            });
+        }
+
+        // Camera setup for MediaPipe Hands
+        async function setupHandsCamera() {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: 'user' },
+                audio: false
+            });
+
+            video.srcObject = stream;
+            const camera = new Camera(video, {
+                onFrame: async () => {
+                    await hands.send({image: video});
+                },
+                width: 640,
+                height: 480
+            });
+            camera.start();
+        }
+
+        // Load ONNX model
+        async function loadModel() {
+            try {
+                console.log("Attempting to load ONNX model...");
+                session = await ort.InferenceSession.create('./mobilenetv2.onnx', {
+                    executionProviders: ['wasm'], // or 'webgl'
+                    graphOptimizationLevel: 'all'
+                });
+
+                console.log("Model loaded successfully.");
+            } catch (error) {
+                console.error("Error loading the ONNX model:", error);
+                statusDiv.innerText = 'Error: Unable to load the liveness detection model.';
+            }
+        }
+
+        // Preprocess the video frame
+        function preprocessFrame(videoElement) {
+            const canvas = document.createElement('canvas');
+            const targetWidth = 224; // MobileNetV2 typically expects 224x224 input
+            const targetHeight = 224;
+
+            canvas.width = targetWidth;
+            canvas.height = targetHeight;
+
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(videoElement, 0, 0, targetWidth, targetHeight);
+
+            const imageData = ctx.getImageData(0, 0, targetWidth, targetHeight);
+            const { data, width, height } = imageData;
+
+            const input = new Float32Array(width * height * 3); // RGB channels
+            for (let i = 0; i < width * height; i++) {
+                input[i * 3] = data[i * 4] / 255; // R
+                input[i * 3 + 1] = data[i * 4 + 1] / 255; // G
+                input[i * 3 + 2] = data[i * 4 + 2] / 255; // B
+            }
+
+            return new ort.Tensor('float32', input, [1, 3, height, width]); // NCHW format
+        }
+
+        // Perform inference with the ONNX model
+        async function detectFace() {
+            try {
+                const inputTensor = preprocessFrame(video);
+                const feeds = { [session.inputNames[0]]: inputTensor };
+                const results = await session.run(feeds);
+
+                const output = results[session.outputNames[0]].data[0];
+
+                if (output > 0.5) {
+                    statusDiv.innerText = 'Status: Live Face Detected';
+                } else {
+                    statusDiv.innerText = 'Status: No Live Face Detected';
+                }
+            } catch (error) {
+                console.error("Error during face detection:", error);
+                statusDiv.innerText = 'Error: Face detection failed.';
+            }
+        }
+
+        // Initialize and run the application
+        async function run() {
+            try {
+                await setupHandsCamera();
+                await loadModel();
+                video.play();
+
+                startButton.addEventListener('click', () => {
+                    setInterval(detectFace, 500); // Run detection every 500 milliseconds
+                });
+            } catch (error) {
+                console.error("Initialization error:", error);
+                statusDiv.innerText = 'Error: Initialization failed. Please try reloading the page.';
+            }
+        }
+
+        run();
+    </script>
+</body>
+</html>
